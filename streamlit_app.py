@@ -1,9 +1,7 @@
 import sqlite3
-from contextlib import contextmanager
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from pathlib import Path
 
-import pandas as pd
 import streamlit as st
 
 # ─────────────────────────────────────────────
@@ -13,152 +11,131 @@ st.set_page_config(
     page_title="Gestão de Mercado",
     page_icon="🛒",
     layout="wide",
-    initial_sidebar_state="expanded",
 )
 
 DB_PATH = Path("mercado.db")
 ALERTA_DIAS = 7
 
+
 # ─────────────────────────────────────────────
 # BANCO DE DADOS
 # ─────────────────────────────────────────────
 
-def init_db() -> None:
-    with get_conn() as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS produtos (
-                id        INTEGER PRIMARY KEY AUTOINCREMENT,
-                nome      TEXT    NOT NULL,
-                ean       TEXT,
-                preco     REAL    NOT NULL,
-                quantidade INTEGER NOT NULL DEFAULT 0,
-                validade  TEXT
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS saidas (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                produto_id  INTEGER NOT NULL,
-                produto_nome TEXT   NOT NULL,
-                quantidade  INTEGER NOT NULL,
-                preco_unit  REAL    NOT NULL,
-                total       REAL    NOT NULL,
-                registrado_em TEXT  NOT NULL,
-                FOREIGN KEY (produto_id) REFERENCES produtos(id)
-            )
-        """)
-
-
-@contextmanager
-def get_conn():
+def get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
-    try:
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
+    return conn
+
+
+def init_db() -> None:
+    conn = get_conn()
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS produtos (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            nome       TEXT    NOT NULL,
+            ean        TEXT,
+            quantidade INTEGER NOT NULL DEFAULT 0,
+            preco      REAL    NOT NULL,
+            validade   TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS saidas (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            produto_id    INTEGER NOT NULL,
+            produto_nome  TEXT    NOT NULL,
+            quantidade    INTEGER NOT NULL,
+            preco_unit    REAL    NOT NULL,
+            total         REAL    NOT NULL,
+            registrado_em TEXT    NOT NULL
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def db_listar() -> list:
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT * FROM produtos ORDER BY validade ASC, nome ASC"
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def db_inserir(nome, ean, quantidade, preco, validade) -> None:
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO produtos (nome, ean, quantidade, preco, validade) VALUES (?,?,?,?,?)",
+        (nome, ean or None, quantidade, preco, str(validade) if validade else None),
+    )
+    conn.commit()
+    conn.close()
+
+
+def db_excluir(pid: int) -> None:
+    conn = get_conn()
+    conn.execute("DELETE FROM produtos WHERE id=?", (pid,))
+    conn.commit()
+    conn.close()
+
+
+def db_baixa(pid: int, qtd: int) -> str:
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT nome, quantidade, preco FROM produtos WHERE id=?", (pid,)
+    ).fetchone()
+    if not row:
         conn.close()
+        return "erro:Produto não encontrado."
+    if row["quantidade"] < qtd:
+        conn.close()
+        return f"erro:Estoque insuficiente. Disponível: {row['quantidade']} un."
+    conn.execute(
+        "UPDATE produtos SET quantidade = quantidade - ? WHERE id=?", (qtd, pid)
+    )
+    conn.execute(
+        """INSERT INTO saidas (produto_id, produto_nome, quantidade, preco_unit, total, registrado_em)
+           VALUES (?,?,?,?,?,datetime('now','localtime'))""",
+        (pid, row["nome"], qtd, row["preco"], round(qtd * row["preco"], 2)),
+    )
+    conn.commit()
+    conn.close()
+    return f"ok:{qtd}x {row['nome']} baixados. Total: R$ {qtd * row['preco']:.2f}"
+
+
+def db_saidas() -> list:
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT * FROM saidas ORDER BY registrado_em DESC LIMIT 50"
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
 
 
 # ─────────────────────────────────────────────
-# QUERIES
+# HELPERS
 # ─────────────────────────────────────────────
 
-def listar_produtos() -> pd.DataFrame:
-    with get_conn() as conn:
-        rows = conn.execute("SELECT * FROM produtos ORDER BY nome").fetchall()
-    if not rows:
-        return pd.DataFrame(columns=["id","nome","ean","preco","quantidade","validade"])
-    df = pd.DataFrame([dict(r) for r in rows])
-    df["validade"] = pd.to_datetime(df["validade"], errors="coerce").dt.date
-    return df
-
-
-def inserir_produto(nome, ean, preco, quantidade, validade) -> None:
-    with get_conn() as conn:
-        conn.execute(
-            "INSERT INTO produtos (nome, ean, preco, quantidade, validade) VALUES (?,?,?,?,?)",
-            (nome, ean or None, preco, quantidade, str(validade) if validade else None),
-        )
-
-
-def atualizar_produto(pid, nome, ean, preco, quantidade, validade) -> None:
-    with get_conn() as conn:
-        conn.execute(
-            """UPDATE produtos
-               SET nome=?, ean=?, preco=?, quantidade=?, validade=?
-               WHERE id=?""",
-            (nome, ean or None, preco, quantidade,
-             str(validade) if validade else None, pid),
-        )
-
-
-def deletar_produto(pid: int) -> None:
-    with get_conn() as conn:
-        conn.execute("DELETE FROM produtos WHERE id=?", (pid,))
-
-
-def registrar_saida(pid: int, nome: str, qtd: int, preco: float) -> str:
-    """Debita estoque e grava histórico. Retorna mensagem de resultado."""
-    with get_conn() as conn:
-        row = conn.execute(
-            "SELECT quantidade FROM produtos WHERE id=?", (pid,)
-        ).fetchone()
-        if row is None:
-            return "❌ Produto não encontrado."
-        disponivel = row["quantidade"]
-        if disponivel < qtd:
-            return f"❌ Estoque insuficiente. Disponível: **{disponivel}**"
-        conn.execute(
-            "UPDATE produtos SET quantidade = quantidade - ? WHERE id=?",
-            (qtd, pid),
-        )
-        conn.execute(
-            """INSERT INTO saidas
-               (produto_id, produto_nome, quantidade, preco_unit, total, registrado_em)
-               VALUES (?,?,?,?,?,?)""",
-            (pid, nome, qtd, preco, round(qtd * preco, 2),
-             datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
-        )
-    return f"✅ Baixa registrada: **{qtd}x {nome}** — Total: R$ {qtd*preco:.2f}"
-
-
-def listar_saidas() -> pd.DataFrame:
-    with get_conn() as conn:
-        rows = conn.execute(
-            "SELECT * FROM saidas ORDER BY registrado_em DESC LIMIT 100"
-        ).fetchall()
-    if not rows:
-        return pd.DataFrame()
-    return pd.DataFrame([dict(r) for r in rows])
-
-
-# ─────────────────────────────────────────────
-# HELPERS DE VALIDADE
-# ─────────────────────────────────────────────
-
-def classificar_validade(val) -> str:
-    if pd.isna(val) or val is None:
-        return "ok"
+def status_validade(val_str: str | None) -> tuple[str, str]:
+    """Retorna (emoji_badge, css_cor) com base na data de validade."""
+    if not val_str:
+        return "⚪ Sem validade", ""
+    val = date.fromisoformat(val_str)
     hoje = date.today()
     if val < hoje:
-        return "vencido"
+        return "🔴 VENCIDO", "background:#fee2e2;border-left:4px solid #ef4444;"
     if val <= hoje + timedelta(days=ALERTA_DIAS):
-        return "alerta"
-    return "ok"
+        return "🟡 Atenção", "background:#fef9c3;border-left:4px solid #f59e0b;"
+    return "🟢 OK", "background:#f0fdf4;border-left:4px solid #22c55e;"
 
 
-def badge_validade(val) -> str:
-    cls = classificar_validade(val)
-    if cls == "vencido":
-        return "🔴 VENCIDO"
-    if cls == "alerta":
-        return "🟡 Atenção"
-    return "🟢 OK"
+def fmt_data(val_str: str | None) -> str:
+    if not val_str:
+        return "—"
+    d = date.fromisoformat(val_str)
+    return d.strftime("%d/%m/%Y")
 
 
 # ─────────────────────────────────────────────
@@ -167,48 +144,44 @@ def badge_validade(val) -> str:
 
 st.markdown("""
 <style>
-[data-testid="stSidebar"] { background: #14532d; }
-[data-testid="stSidebar"] * { color: #dcfce7 !important; }
-[data-testid="stSidebar"] .stSelectbox label,
-[data-testid="stSidebar"] h1 { color: #ffffff !important; }
+[data-testid="stSidebar"] { background:#14532d; }
+[data-testid="stSidebar"] * { color:#dcfce7 !important; }
 
-div[data-testid="metric-container"] {
-    background: white;
-    border: 1px solid #e5e7eb;
-    border-radius: 12px;
-    padding: 16px 20px;
-    box-shadow: 0 1px 3px rgba(0,0,0,.06);
+.card {
+    border-radius:12px; padding:16px 18px; margin-bottom:10px;
+    border:1px solid #e5e7eb;
 }
-.kpi-vencido  { border-left: 4px solid #ef4444 !important; }
-.kpi-alerta   { border-left: 4px solid #f59e0b !important; }
-.kpi-ok       { border-left: 4px solid #22c55e !important; }
-
-.tag-vencido { background:#fee2e2; color:#b91c1c; padding:2px 8px;
-               border-radius:9999px; font-size:.75rem; font-weight:600; }
-.tag-alerta  { background:#fef3c7; color:#92400e; padding:2px 8px;
-               border-radius:9999px; font-size:.75rem; font-weight:600; }
-.tag-ok      { background:#dcfce7; color:#166534; padding:2px 8px;
-               border-radius:9999px; font-size:.75rem; font-weight:600; }
+.kpi {
+    background:white; border-radius:12px; padding:18px 20px;
+    border:1px solid #e5e7eb; text-align:center;
+    box-shadow:0 1px 4px rgba(0,0,0,.06);
+}
+.kpi .num { font-size:2rem; font-weight:700; line-height:1.1; }
+.kpi .lbl { font-size:.75rem; color:#6b7280; margin-top:4px; }
+.tag {
+    display:inline-block; padding:2px 10px; border-radius:9999px;
+    font-size:.72rem; font-weight:600;
+}
 </style>
 """, unsafe_allow_html=True)
 
 
 # ─────────────────────────────────────────────
-# INICIALIZAÇÃO
+# INIT
 # ─────────────────────────────────────────────
 
 init_db()
 
 # ─────────────────────────────────────────────
-# SIDEBAR — NAVEGAÇÃO
+# SIDEBAR
 # ─────────────────────────────────────────────
 
 with st.sidebar:
     st.markdown("## 🛒 Mercado")
     st.markdown("---")
     pagina = st.radio(
-        "Navegação",
-        ["📊 Dashboard", "➕ Cadastrar Produto", "✏️ Gerenciar Estoque", "🛍️ Baixa de Caixa", "📋 Histórico de Saídas"],
+        "Menu",
+        ["📊 Dashboard", "➕ Adicionar Produto", "🛍️ Baixa de Caixa", "📋 Histórico"],
         label_visibility="collapsed",
     )
     st.markdown("---")
@@ -216,248 +189,184 @@ with st.sidebar:
 
 
 # ─────────────────────────────────────────────
-# PÁGINA: DASHBOARD
+# DASHBOARD
 # ─────────────────────────────────────────────
 
 if pagina == "📊 Dashboard":
     st.title("📊 Dashboard")
-    df = listar_produtos()
 
+    produtos = db_listar()
     hoje = date.today()
     limite = hoje + timedelta(days=ALERTA_DIAS)
 
-    total_produtos = len(df)
-    total_itens    = int(df["quantidade"].sum()) if not df.empty else 0
+    vencidos  = [p for p in produtos if p["validade"] and date.fromisoformat(p["validade"]) < hoje and p["quantidade"] > 0]
+    alertas   = [p for p in produtos if p["validade"] and hoje <= date.fromisoformat(p["validade"]) <= limite]
+    sem_stock = [p for p in produtos if p["quantidade"] == 0]
+    total_itens = sum(p["quantidade"] for p in produtos)
 
-    vencidos = df[df["validade"].apply(lambda v: pd.notna(v) and v < hoje)] if not df.empty else pd.DataFrame()
-    alertas  = df[df["validade"].apply(lambda v: pd.notna(v) and hoje <= v <= limite)] if not df.empty else pd.DataFrame()
-    sem_estoque = df[df["quantidade"] == 0] if not df.empty else pd.DataFrame()
-
+    # ── KPIs ──
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("📦 Produtos Cadastrados", total_produtos)
-    c2.metric("🔢 Total de Itens", total_itens)
-    c3.metric("🔴 Vencidos com Estoque", len(vencidos[vencidos["quantidade"] > 0]) if not vencidos.empty else 0)
-    c4.metric("🟡 Vencem em 7 dias", len(alertas))
+    c1.markdown(f'<div class="kpi"><div class="num">{len(produtos)}</div><div class="lbl">📦 Produtos</div></div>', unsafe_allow_html=True)
+    c2.markdown(f'<div class="kpi"><div class="num">{total_itens}</div><div class="lbl">🔢 Itens em Estoque</div></div>', unsafe_allow_html=True)
+    c3.markdown(f'<div class="kpi" style="border-top:3px solid #ef4444"><div class="num" style="color:#ef4444">{len(vencidos)}</div><div class="lbl">🔴 Vencidos</div></div>', unsafe_allow_html=True)
+    c4.markdown(f'<div class="kpi" style="border-top:3px solid #f59e0b"><div class="num" style="color:#f59e0b">{len(alertas)}</div><div class="lbl">🟡 Vencem em {ALERTA_DIAS}d</div></div>', unsafe_allow_html=True)
 
-    st.markdown("---")
-
-    col_a, col_b = st.columns(2)
-
-    with col_a:
-        st.subheader("🔴 Produtos Vencidos")
-        df_v = vencidos[vencidos["quantidade"] > 0][["nome","quantidade","validade","preco"]] if not vencidos.empty else pd.DataFrame()
-        if df_v.empty:
-            st.success("Nenhum produto vencido com estoque.")
-        else:
-            st.error(f"{len(df_v)} produto(s) vencido(s) ainda em estoque!")
-            st.dataframe(df_v, use_container_width=True, hide_index=True,
-                column_config={"validade": st.column_config.DateColumn("Validade", format="DD/MM/YYYY"),
-                               "preco": st.column_config.NumberColumn("Preço", format="R$ %.2f")})
-
-    with col_b:
-        st.subheader("🟡 Vencem nos Próximos 7 Dias")
-        df_a = alertas[["nome","quantidade","validade","preco"]] if not alertas.empty else pd.DataFrame()
-        if df_a.empty:
-            st.success("Nenhum produto em alerta de vencimento.")
-        else:
-            st.warning(f"{len(df_a)} produto(s) próximos do vencimento!")
-            st.dataframe(df_a, use_container_width=True, hide_index=True,
-                column_config={"validade": st.column_config.DateColumn("Validade", format="DD/MM/YYYY"),
-                               "preco": st.column_config.NumberColumn("Preço", format="R$ %.2f")})
+    # ── Alertas em destaque ──
+    if vencidos:
+        st.error(f"**{len(vencidos)} produto(s) VENCIDO(S) ainda em estoque — retirar imediatamente!**")
+    if alertas:
+        st.warning(f"**{len(alertas)} produto(s) vencem nos próximos {ALERTA_DIAS} dias.**")
 
     st.markdown("---")
     st.subheader("📦 Todos os Produtos")
 
-    if df.empty:
-        st.info("Nenhum produto cadastrado ainda.")
+    if not produtos:
+        st.info("Nenhum produto cadastrado. Vá em **Adicionar Produto**.")
     else:
-        df_view = df.copy()
-        df_view["status"] = df_view["validade"].apply(badge_validade)
-        st.dataframe(
-            df_view[["id","nome","ean","quantidade","preco","validade","status"]],
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "id":       st.column_config.NumberColumn("ID", width="small"),
-                "nome":     st.column_config.TextColumn("Produto"),
-                "ean":      st.column_config.TextColumn("EAN"),
-                "quantidade": st.column_config.NumberColumn("Qtd", width="small"),
-                "preco":    st.column_config.NumberColumn("Preço", format="R$ %.2f"),
-                "validade": st.column_config.DateColumn("Validade", format="DD/MM/YYYY"),
-                "status":   st.column_config.TextColumn("Status"),
-            },
-        )
+        # Cabeçalho da tabela
+        h = st.columns([3, 1, 1, 1, 2, 1])
+        for col, label in zip(h, ["Produto", "EAN", "Qtd", "Preço", "Validade", "Status"]):
+            col.markdown(f"**{label}**")
+        st.divider()
+
+        for p in produtos:
+            badge, estilo = status_validade(p["validade"])
+            with st.container():
+                st.markdown(f'<div class="card" style="{estilo}">', unsafe_allow_html=True)
+                cols = st.columns([3, 1, 1, 1, 2, 1])
+                cols[0].write(f"**{p['nome']}**")
+                cols[1].write(p["ean"] or "—")
+                cols[2].write(str(p["quantidade"]))
+                cols[3].write(f"R$ {p['preco']:.2f}")
+                cols[4].write(fmt_data(p["validade"]))
+                cols[5].write(badge)
+
+                with st.expander("⋯ ações"):
+                    st.caption(f"ID: {p['id']}")
+                    if st.button("🗑️ Excluir produto", key=f"del_{p['id']}", type="primary"):
+                        db_excluir(p["id"])
+                        st.success(f"**{p['nome']}** removido.")
+                        st.rerun()
+
+                st.markdown("</div>", unsafe_allow_html=True)
 
 
 # ─────────────────────────────────────────────
-# PÁGINA: CADASTRAR PRODUTO
+# ADICIONAR PRODUTO
 # ─────────────────────────────────────────────
 
-elif pagina == "➕ Cadastrar Produto":
-    st.title("➕ Cadastrar Produto")
+elif pagina == "➕ Adicionar Produto":
+    st.title("➕ Adicionar Produto")
 
-    with st.form("form_cadastro", clear_on_submit=True):
+    with st.form("form_add", clear_on_submit=True):
         c1, c2 = st.columns(2)
         nome       = c1.text_input("Nome do Produto *", placeholder="Ex: Leite Integral 1L")
         ean        = c2.text_input("Código EAN (opcional)", placeholder="Ex: 7891234567890")
 
         c3, c4, c5 = st.columns(3)
-        preco      = c3.number_input("Preço de Venda (R$) *", min_value=0.01, step=0.10, format="%.2f")
-        quantidade = c4.number_input("Quantidade *", min_value=0, step=1)
-        validade   = c5.date_input("Data de Validade", value=None, min_value=date(2000, 1, 1))
+        quantidade = c3.number_input("Quantidade *", min_value=0, step=1, value=1)
+        preco      = c4.number_input("Preço de Venda (R$) *", min_value=0.01, step=0.10, format="%.2f", value=1.00)
+        validade   = c5.date_input("Data de Validade", value=None)
 
-        submitted = st.form_submit_button("💾 Cadastrar Produto", use_container_width=True, type="primary")
+        ok = st.form_submit_button("💾 Cadastrar", type="primary", use_container_width=True)
 
-    if submitted:
+    if ok:
         if not nome.strip():
             st.error("O nome do produto é obrigatório.")
-        elif preco <= 0:
-            st.error("O preço deve ser maior que zero.")
         else:
-            inserir_produto(nome.strip(), ean.strip(), preco, quantidade, validade)
-            st.success(f"✅ **{nome}** cadastrado com sucesso!")
+            db_inserir(nome.strip(), ean.strip(), quantidade, preco, validade)
+            st.success(f"✅ **{nome.strip()}** cadastrado com sucesso!")
             st.balloons()
 
 
 # ─────────────────────────────────────────────
-# PÁGINA: GERENCIAR ESTOQUE
-# ─────────────────────────────────────────────
-
-elif pagina == "✏️ Gerenciar Estoque":
-    st.title("✏️ Gerenciar Estoque")
-    df = listar_produtos()
-
-    if df.empty:
-        st.info("Nenhum produto cadastrado ainda. Vá em **Cadastrar Produto**.")
-        st.stop()
-
-    produto_nomes = df["nome"].tolist()
-    nome_sel = st.selectbox("Selecione o produto para editar ou excluir", produto_nomes)
-    row = df[df["nome"] == nome_sel].iloc[0]
-
-    st.markdown("---")
-    tab_editar, tab_excluir = st.tabs(["✏️ Editar", "🗑️ Excluir"])
-
-    with tab_editar:
-        with st.form("form_editar"):
-            c1, c2 = st.columns(2)
-            novo_nome = c1.text_input("Nome", value=row["nome"])
-            novo_ean  = c2.text_input("EAN", value=row["ean"] or "")
-
-            c3, c4, c5 = st.columns(3)
-            novo_preco = c3.number_input("Preço (R$)", value=float(row["preco"]), min_value=0.01, step=0.10, format="%.2f")
-            nova_qtd   = c4.number_input("Quantidade", value=int(row["quantidade"]), min_value=0, step=1)
-
-            val_atual = row["validade"] if pd.notna(row["validade"]) else None
-            nova_val  = c5.date_input("Validade", value=val_atual)
-
-            salvar = st.form_submit_button("💾 Salvar Alterações", type="primary", use_container_width=True)
-
-        if salvar:
-            atualizar_produto(int(row["id"]), novo_nome.strip(), novo_ean.strip(),
-                              novo_preco, nova_qtd, nova_val)
-            st.success(f"✅ **{novo_nome}** atualizado com sucesso!")
-            st.rerun()
-
-    with tab_excluir:
-        st.warning(f"Tem certeza que deseja excluir **{nome_sel}**? Esta ação não pode ser desfeita.")
-        if st.button("🗑️ Confirmar Exclusão", type="primary", use_container_width=True):
-            deletar_produto(int(row["id"]))
-            st.success(f"✅ **{nome_sel}** removido do estoque.")
-            st.rerun()
-
-
-# ─────────────────────────────────────────────
-# PÁGINA: BAIXA DE CAIXA
+# BAIXA DE CAIXA
 # ─────────────────────────────────────────────
 
 elif pagina == "🛍️ Baixa de Caixa":
     st.title("🛍️ Baixa de Caixa")
-    st.caption("Registre a saída de itens vendidos. O estoque é debitado automaticamente.")
+    st.caption("Selecione o produto vendido e informe a quantidade. O estoque é debitado automaticamente.")
 
-    df = listar_produtos()
-    df_com_estoque = df[df["quantidade"] > 0] if not df.empty else pd.DataFrame()
+    produtos = db_listar()
+    com_estoque = [p for p in produtos if p["quantidade"] > 0]
 
-    if df_com_estoque.empty:
+    if not com_estoque:
         st.warning("Nenhum produto com estoque disponível.")
         st.stop()
 
-    # Monta mapa nome → row para lookup rápido
-    opcoes = df_com_estoque["nome"].tolist()
+    opcoes = {f"{p['nome']} (estoque: {p['quantidade']} un)": p for p in com_estoque}
 
     with st.form("form_baixa", clear_on_submit=True):
-        c1, c2 = st.columns([3, 1])
-        nome_prod = c1.selectbox("Produto", opcoes)
-        row_prod  = df_com_estoque[df_com_estoque["nome"] == nome_prod].iloc[0]
+        escolha = st.selectbox("Produto *", list(opcoes.keys()))
+        prod    = opcoes[escolha]
 
-        c1.caption(f"Estoque atual: **{int(row_prod['quantidade'])} un** · Preço: **R$ {row_prod['preco']:.2f}**")
+        c1, c2 = st.columns(2)
+        qtd = c1.number_input("Quantidade a baixar *", min_value=1,
+                               max_value=prod["quantidade"], step=1, value=1)
+        c2.metric("Total previsto", f"R$ {qtd * prod['preco']:.2f}")
 
-        qtd_baixa = c2.number_input("Quantidade", min_value=1,
-                                    max_value=int(row_prod["quantidade"]), step=1, value=1)
-        total_prev = qtd_baixa * float(row_prod["preco"])
-        st.info(f"💰 Total previsto: **R$ {total_prev:.2f}**")
+        ok = st.form_submit_button("✅ Registrar Baixa", type="primary", use_container_width=True)
 
-        registrar = st.form_submit_button("✅ Registrar Baixa", type="primary", use_container_width=True)
-
-    if registrar:
-        msg = registrar_saida(
-            int(row_prod["id"]),
-            row_prod["nome"],
-            qtd_baixa,
-            float(row_prod["preco"]),
-        )
-        if msg.startswith("✅"):
-            st.success(msg)
+    if ok:
+        resultado = db_baixa(prod["id"], qtd)
+        tipo, msg = resultado.split(":", 1)
+        if tipo == "ok":
+            st.success(f"✅ {msg}")
             st.rerun()
         else:
-            st.error(msg)
+            st.error(f"❌ {msg}")
 
     st.markdown("---")
-    st.subheader("Estoque Disponível")
-    st.dataframe(
-        df_com_estoque[["nome","quantidade","preco","validade"]],
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "nome":       st.column_config.TextColumn("Produto"),
-            "quantidade": st.column_config.NumberColumn("Qtd", width="small"),
-            "preco":      st.column_config.NumberColumn("Preço", format="R$ %.2f"),
-            "validade":   st.column_config.DateColumn("Validade", format="DD/MM/YYYY"),
-        },
-    )
+    st.subheader("Estoque disponível")
+
+    hd = st.columns([3, 1, 1, 2])
+    for col, lbl in zip(hd, ["Produto", "Qtd", "Preço", "Validade"]):
+        col.markdown(f"**{lbl}**")
+    st.divider()
+
+    for p in com_estoque:
+        badge, estilo = status_validade(p["validade"])
+        row = st.columns([3, 1, 1, 2])
+        row[0].write(p["nome"])
+        row[1].write(str(p["quantidade"]))
+        row[2].write(f"R$ {p['preco']:.2f}")
+        row[3].write(f"{fmt_data(p['validade'])}  {badge}")
 
 
 # ─────────────────────────────────────────────
-# PÁGINA: HISTÓRICO DE SAÍDAS
+# HISTÓRICO
 # ─────────────────────────────────────────────
 
-elif pagina == "📋 Histórico de Saídas":
+elif pagina == "📋 Histórico":
     st.title("📋 Histórico de Saídas")
 
-    df_s = listar_saidas()
+    saidas = db_saidas()
 
-    if df_s.empty:
+    if not saidas:
         st.info("Nenhuma saída registrada ainda.")
         st.stop()
 
-    total_dia   = df_s[df_s["registrado_em"].str.startswith(str(date.today()))]["total"].sum()
-    total_geral = df_s["total"].sum()
+    hoje_str = str(date.today())
+    saidas_hoje = [s for s in saidas if s["registrado_em"].startswith(hoje_str)]
+    total_hoje  = sum(s["total"] for s in saidas_hoje)
+    total_geral = sum(s["total"] for s in saidas)
 
     c1, c2, c3 = st.columns(3)
-    c1.metric("💵 Vendas Hoje (R$)", f"R$ {total_dia:.2f}")
-    c2.metric("📦 Baixas Hoje", len(df_s[df_s["registrado_em"].str.startswith(str(date.today()))]))
-    c3.metric("💰 Total Histórico (R$)", f"R$ {total_geral:.2f}")
+    c1.metric("💵 Vendas Hoje", f"R$ {total_hoje:.2f}")
+    c2.metric("📦 Baixas Hoje", len(saidas_hoje))
+    c3.metric("💰 Total Histórico", f"R$ {total_geral:.2f}")
 
     st.markdown("---")
-    st.dataframe(
-        df_s[["registrado_em","produto_nome","quantidade","preco_unit","total"]],
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "registrado_em":  st.column_config.TextColumn("Data/Hora"),
-            "produto_nome":   st.column_config.TextColumn("Produto"),
-            "quantidade":     st.column_config.NumberColumn("Qtd", width="small"),
-            "preco_unit":     st.column_config.NumberColumn("Preço Unit.", format="R$ %.2f"),
-            "total":          st.column_config.NumberColumn("Total", format="R$ %.2f"),
-        },
-    )
+
+    hd = st.columns([2, 3, 1, 1, 1])
+    for col, lbl in zip(hd, ["Data/Hora", "Produto", "Qtd", "Preço Unit.", "Total"]):
+        col.markdown(f"**{lbl}**")
+    st.divider()
+
+    for s in saidas:
+        row = st.columns([2, 3, 1, 1, 1])
+        row[0].write(s["registrado_em"])
+        row[1].write(s["produto_nome"])
+        row[2].write(str(s["quantidade"]))
+        row[3].write(f"R$ {s['preco_unit']:.2f}")
+        row[4].write(f"R$ {s['total']:.2f}")
