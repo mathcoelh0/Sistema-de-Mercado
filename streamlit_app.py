@@ -8,7 +8,7 @@ import streamlit as st
 # CONFIG
 # ─────────────────────────────────────────────
 st.set_page_config(
-    page_title="Gestão de Mercado",
+    page_title="Supermercado Brilhante",
     page_icon="🛒",
     layout="wide",
 )
@@ -52,6 +52,16 @@ def init_db() -> None:
         )
     """)
     conn.commit()
+
+    # Seed: insere produto de demonstração se tabela estiver vazia
+    count = conn.execute("SELECT COUNT(*) FROM produtos").fetchone()[0]
+    if count == 0:
+        conn.execute(
+            "INSERT INTO produtos (nome, ean, quantidade, preco, validade) VALUES (?,?,?,?,?)",
+            ("Detergente Ypê Neutro 500ml", "7891022100105", 50, 3.49, "2026-05-15"),
+        )
+        conn.commit()
+
     conn.close()
 
 
@@ -177,15 +187,17 @@ init_db()
 # ─────────────────────────────────────────────
 
 with st.sidebar:
-    st.markdown("## 🛒 Mercado")
+    st.markdown("## 🛒 Supermercado Brilhante")
     st.markdown("---")
     pagina = st.radio(
         "Menu",
-        ["📊 Dashboard", "➕ Adicionar Produto", "🛍️ Baixa de Caixa", "📋 Histórico"],
+        ["📊 Dashboard", "➕ Adicionar Produto", "🛍️ Conciliação de Saída (Caixa vs Estoque)", "📋 Histórico"],
         label_visibility="collapsed",
     )
     st.markdown("---")
     st.caption(f"Hoje: {date.today().strftime('%d/%m/%Y')}")
+    st.markdown("---")
+    st.caption("Sistema de Auditoria de Estoque v1.0 | Desenvolvido por Matheus Coelho")
 
 
 # ─────────────────────────────────────────────
@@ -193,7 +205,7 @@ with st.sidebar:
 # ─────────────────────────────────────────────
 
 if pagina == "📊 Dashboard":
-    st.title("📊 Dashboard")
+    st.title("🚀 Painel de Controle - Supermercado Brilhante")
 
     produtos = db_listar()
     hoje = date.today()
@@ -283,8 +295,8 @@ elif pagina == "➕ Adicionar Produto":
 # BAIXA DE CAIXA
 # ─────────────────────────────────────────────
 
-elif pagina == "🛍️ Baixa de Caixa":
-    st.title("🛍️ Baixa de Caixa")
+elif pagina == "🛍️ Conciliação de Saída (Caixa vs Estoque)":
+    st.title("🛍️ Conciliação de Saída (Caixa vs Estoque)")
     st.caption("Selecione o produto vendido e informe a quantidade. O estoque é debitado automaticamente.")
 
     produtos = db_listar()
@@ -311,7 +323,7 @@ elif pagina == "🛍️ Baixa de Caixa":
         resultado = db_baixa(prod["id"], qtd)
         tipo, msg = resultado.split(":", 1)
         if tipo == "ok":
-            st.success(f"✅ {msg}")
+            st.success(f"✅ {msg}\n\nBaixa registrada com sucesso. Estoque atualizado para auditoria do SysPDV.")
             st.rerun()
         else:
             st.error(f"❌ {msg}")
